@@ -1,0 +1,4 @@
+data/things_eeg/
+results/
+__pycache__/
+*.py[cod]

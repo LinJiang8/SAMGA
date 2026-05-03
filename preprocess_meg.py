@@ -1,0 +1,238 @@
+import os
+import shutil
+import argparse
+
+import mne
+import pandas as pd
+import numpy as np
+
+from module.util import dump_pretty
+
+if __name__ == "__main__":
+    # Get input arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--raw_data_dir', default='./data/things_meg', type=str, help="raw data directory")
+    parser.add_argument('--output_meg_dir', default='./data/things_meg/preprocessed_meg', type=str, help="output directory")
+    parser.add_argument('--output_image_dir', default='./data/things_meg/image_set', type=str, help="output directory")
+    parser.add_argument("--precision", default="fp32", type=str, choices=["fp64", "fp32", "fp16"], help="precision: float32 or float16")
+    parser.add_argument('--zscore', action="store_true")
+    args = parser.parse_args()
+
+    # Print input arguments
+    print('\nInput arguments:')
+    for key, val in vars(args).items():
+        print('{:20} {}'.format(key, val))
+
+    meg_dir = os.path.join(args.raw_data_dir, 'raw_meg')
+    image_dir = os.path.join(args.raw_data_dir, 'image_set', 'object_images')
+
+    image_concept_list = []
+    total_images = 0
+    concept_idx = 1
+    file_list = []
+
+    for concept_name in sorted(os.listdir(image_dir)):
+        concept_path = os.path.join(image_dir, concept_name)
+        if os.path.isdir(concept_path):
+            files = sorted(os.listdir(concept_path))
+            total_images += len(files)
+            file_list.extend([os.path.join(concept_path, f) for f in files])
+            image_concept_list.extend([concept_idx] * len(files))
+            concept_idx += 1
+
+    print(f"Number of concepts: {concept_idx - 1}")
+    print(f"There are a total of {total_images} files in the image directory '{image_dir}'")
+
+    for sub_id in range(1, 5):
+        # Check if the subject has been processed
+        print(f"\nProcessing Subject {sub_id}...")
+        if os.path.isdir(os.path.join(args.output_meg_dir, 'sub-'+format(sub_id,'02'))):
+            if sub_id != 4:
+                print(f"Subject {sub_id} already processed, skipping...")
+                continue
+            else:
+                print(f"Subject {sub_id} already processed, but re-processing for meta information...")
+        
+        fif_file = os.path.join(meg_dir, f"sub-{format(sub_id,'02')}", f"preprocessed_P{sub_id}-epo.fif")
+
+        def read_and_crop_epochs(fif_file):
+            epochs = mne.read_epochs(fif_file, preload=True)
+            cropped_epochs = epochs.crop(tmin=0, tmax=1.0)
+            return cropped_epochs
+
+        epochs = read_and_crop_epochs(fif_file)    
+
+        sorted_indices = np.argsort(epochs.events[:, 2])
+        epochs = epochs[sorted_indices]
+
+        print("Num of events:", len(epochs.events))
+        # Verify the shape of the epochs data
+        ch_names = epochs.ch_names
+        print("Num of Channels:", len(ch_names))
+        print("Channel Names:", ch_names)
+
+        def filter_valid_epochs(epochs, exclude_event_id=999999):
+            return epochs[epochs.events[:, 2] != exclude_event_id]
+        valid_epochs = filter_valid_epochs(epochs)
+
+        def identify_zs_event_ids(epochs, num_repetitions=12):
+            event_ids = epochs.events[:, 2]
+            unique_event_ids, counts = np.unique(event_ids, return_counts=True)
+            zs_event_ids = unique_event_ids[counts == num_repetitions]
+            return zs_event_ids
+
+        zs_event_ids = identify_zs_event_ids(valid_epochs)
+        # Verify the zero-shot event IDs
+        print("Zero-shot Event IDs:", zs_event_ids)
+
+        # Separate and process datasets
+        training_epochs = valid_epochs[~np.isin(valid_epochs.events[:, 2], zs_event_ids)]
+        # Verify the number of events in the training set
+        print("Number of events in the training set:", len(training_epochs.events))
+
+        # Extract event IDs from the filtered training epochs
+        training_event_ids = np.unique(training_epochs.events[:, 2])
+
+        zs_test_epochs = valid_epochs[np.isin(valid_epochs.events[:, 2], zs_event_ids)]
+        print("Number of events in the zero-shot test set:", len(zs_test_epochs.events))
+        
+
+        zs_event_to_category_map = {}
+        for i, event_id in enumerate(zs_event_ids):
+            # Using the row index (i) to map to the image category index
+            # Assuming the first event_id corresponds to the first row, second event_id to the second row, and so on
+            image_category_index = image_concept_list[event_id-1]
+            
+            zs_event_to_category_map[event_id] = image_category_index
+            
+        test_set_categories = []
+        # Iterate over the event IDs in the test set
+        for event_id in zs_event_ids:
+            if event_id in zs_event_to_category_map:
+                # Get the category index from the mapping
+                category_index = zs_event_to_category_map[event_id]
+                test_set_categories.append(category_index)
+                
+        event_to_category_map = {}
+        for i, event_id in enumerate(training_event_ids):
+            # Using the row index (i) to map to the image category index
+            # Assuming the first event_id corresponds to the first row, second event_id to the second row, and so on
+            image_category_index = image_concept_list[event_id-1]
+            
+            event_to_category_map[event_id] = image_category_index
+            
+        train_set_categories = []
+        # Extract event IDs from the training set
+        training_event_ids = training_epochs.events[:, 2]
+        # Iterate over the event IDs in the training set
+        for event_id in training_event_ids:
+            if event_id in event_to_category_map:
+                # Get the category index from the mapping
+                category_index = event_to_category_map[event_id]        
+                train_set_categories.append(category_index)
+
+        train_set_categories_filtered = [item for item in train_set_categories if item not in test_set_categories]
+        len(train_set_categories_filtered)
+
+        # Create a mask for epochs to keep in the training set
+        keep_epochs_mask = [category not in test_set_categories for category in train_set_categories]
+        # Apply the mask to filter out epochs from training_epochs
+        training_epochs_filtered = training_epochs[keep_epochs_mask]
+
+        def reshape_meg_data(epochs, train):
+            if train:
+                final_data = epochs.get_data()[:, :, :-1].reshape(1654, 12, 271, 200)[:, :, np.newaxis, :, :]
+            else:
+                final_data = epochs.get_data()[:, :, :-1].reshape(200, 12, 271, 200)[:, np.newaxis, :, :]
+            return final_data
+
+        train_data = reshape_meg_data(training_epochs_filtered, train=True)
+        print("train data shape:", train_data.shape)
+        test_data = reshape_meg_data(zs_test_epochs, train=False)
+        print("test data shape:", test_data.shape)
+        
+        if args.zscore:
+            # zscore on train (channel wise)
+            mean_train = np.mean(train_data, axis=(0,1,2,4), keepdims=True)
+            std_train = np.std(train_data, axis=(0,1,2,4), keepdims=True)
+            train_data = (train_data - mean_train) / std_train
+            test_data = (test_data - mean_train) / std_train
+            print("Z-score normalization applied.")
+
+        times = np.round(np.linspace(0, 0.995, 200), 3)
+        
+        if args.precision == "fp16":
+            train_data = train_data.astype(np.float16)
+            test_data = test_data.astype(np.float16)
+        elif args.precision == "fp32":
+            train_data = train_data.astype(np.float32)
+            test_data = test_data.astype(np.float32)
+        elif args.precision == "fp64":
+            train_data = train_data.astype(np.float64)
+            test_data = test_data.astype(np.float64)
+
+        save_dir = os.path.join(args.output_meg_dir, 'sub-'+format(sub_id,'02'))
+        os.makedirs(save_dir, exist_ok=True)
+        np.save(os.path.join(save_dir, 'train.npy'), train_data)
+        
+        np.save(os.path.join(save_dir, 'test.npy'), test_data)
+        
+    # save info file
+    info_dict = {
+        "ch_names": ch_names,
+        "times": times.tolist(),
+        "baseline_duration": 0.2,
+        "after_duration": 1.0,
+        "normalization": "zscore" if args.zscore else "none",
+        "sfreq": 200,
+        "precision": args.precision,
+        "train_data_shape": train_data.shape,
+        "test_data_shape": test_data.shape
+    }
+    with open(os.path.join(args.output_meg_dir, "info.json"), "w", encoding="utf-8") as f:
+        dump_pretty(info_dict, f, indent=4, ensure_ascii=False)
+
+    ################################################################################
+    # processing image files
+
+    # load csv file
+    path = os.path.join(args.raw_data_dir, "sourcedata/sample_attributes_P1.csv")
+    df = pd.read_csv(path)
+
+    print(f"CSV file '{path}' has been loaded, containing {len(df)} rows.")
+
+    # filter train images
+    train_df = df[(df['category_nr'] <= 1854) & (df['test_image_nr'].isna())]
+
+    # filter test images
+    test_df = df[(df['category_nr'] <= 1854) & (df['trial_type'] == 'test')]
+
+    # ensure no overlap in categories between train and test sets
+    train_df = train_df[~train_df['category_nr'].isin(test_df['category_nr'])]
+
+    # sort by category_nr
+    train_df = train_df.sort_values(by=['category_nr'])
+    test_df = test_df.sort_values(by=['category_nr'])
+
+    base_dir = os.path.join(args.raw_data_dir, 'image_set/object_images')
+
+    print(f"Training set has {len(train_df)} images.")
+    dst_dir = os.path.join(args.output_image_dir, 'train_images')
+    for index, row in train_df.iterrows():
+        category_nr = str(row['category_nr']).zfill(5)
+        src_path = row['image_path'].replace('images_meg/', base_dir + '/')
+        concept = os.path.basename(os.path.dirname(src_path))
+        dst_path = f"{dst_dir}/{category_nr}_{concept}/{os.path.basename(src_path)}"
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        shutil.copy(src_path, dst_path)
+
+    print(f"Test set has {len(test_df)} images.")
+    dst_dir = os.path.join(args.output_image_dir, 'test_images')
+    for index, row in test_df.iterrows():
+        category_nr = str(row['category_nr']).zfill(5)
+        src_path = row['image_path'].replace('images_test_meg/', base_dir + '/')
+        concept = os.path.basename(src_path).rsplit('_', 1)[0]
+        src_path = os.path.join(os.path.dirname(src_path), concept, os.path.basename(src_path))
+        dst_path = f"{dst_dir}/{category_nr}_{concept}/{os.path.basename(src_path)}"
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        shutil.copy(src_path, dst_path)
