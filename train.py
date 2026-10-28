@@ -156,6 +156,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', default='cuda:0', type=str, help='training device')
     parser.add_argument('--num_epochs', default=30, type=int, help='number of epochs')
+    parser.add_argument('--protocol', choices=['inter', 'intra'], default='inter', help='evaluation protocol')
     parser.add_argument('--batch_size', default=1024, type=int, help='batch size')
     parser.add_argument('--learning_rate', default=1e-4, type=float)
     parser.add_argument('--output_dir', default='./result', type=str)
@@ -214,25 +215,33 @@ if __name__ == '__main__':
     parser.add_argument('--layer_prior_strength', type=float, default=1.0)
 
     args = parser.parse_args()
-    # Fixed, precommitted protocol; no target-dependent checkpoint selection.
-    if args.num_epochs != 30:
-        raise ValueError("This trainer is fixed to 30 epochs (set --num_epochs 30).")
+    # Fixed-epoch protocols: no test-dependent checkpoint selection or early stopping.
+    if args.protocol == 'inter':
+        if args.num_epochs != 30:
+            raise ValueError("Inter protocol in this trainer is fixed to 30 epochs.")
+        if len(args.test_subject_ids) != 1:
+            raise ValueError("Inter-subject LOSO requires exactly one held-out subject.")
+        if set(args.train_subject_ids) & set(args.test_subject_ids):
+            raise ValueError("Target subject occurs in source training subjects (LOSO leakage)!")
+    else:
+        if args.num_epochs != 50:
+            raise ValueError("Intra protocol in this trainer is fixed to 50 epochs.")
+        if len(args.train_subject_ids) != 1 or len(args.test_subject_ids) != 1:
+            raise ValueError("Intra-subject protocol requires exactly one train subject and one test subject.")
+        if args.train_subject_ids[0] != args.test_subject_ids[0]:
+            raise ValueError("Intra-subject protocol requires train_subject_ids == test_subject_ids.")
     if not 0 < args.stage1_epochs < args.num_epochs:
-        raise ValueError("Expected 0 < stage1_epochs < 30.")
+        raise ValueError('Require 0 < stage1_epochs < num_epochs.')
     if args.stage1_epochs != 20:
-        raise ValueError('This controlled ablation keeps Stage 1 fixed at 20 epochs.')
+        raise ValueError('This controlled experiment keeps Stage 1 fixed at 20 epochs.')
     if args.stage2_learning_rate <= 0:
         raise ValueError('--stage2_learning_rate must be positive.')
     if args.stage2_min_lr <= 0 or args.stage2_min_lr > args.stage2_learning_rate:
         raise ValueError('Require 0 < stage2_min_lr <= stage2_learning_rate.')
-    if len(args.test_subject_ids) != 1:
-        raise ValueError("Inter-subject LOSO requires exactly one held-out subject.")
-    if set(args.train_subject_ids) & set(args.test_subject_ids):
-        raise ValueError("Target subject occurs in source training subjects (LOSO leakage)!")
     if args.router_eval_mode != 'global':
-        raise ValueError("Strict LOSO evaluation requires --router_eval_mode global.")
+        raise ValueError('This matched SAMGA protocol uses --router_eval_mode global.')
     if args.eeg_test_aug or args.image_test_aug:
-        raise ValueError("Strict final evaluation does not support test-time augmentation flags.")
+        raise ValueError('Final evaluation does not support test-time augmentation flags.')
     seed = seed_everything(seed=args.seed)
 
     if args.output_name is not None:
@@ -497,7 +506,7 @@ if __name__ == '__main__':
         return optim.AdamW(trainable_parameters, lr=lr, betas=(0.9, 0.999), weight_decay=1e-4)
 
     def learning_rate_for_epoch(epoch):
-        # E1-E20 unchanged; E21-E30 apply Stage-2 constant or cosine schedule.
+        # Stage 1 uses args.learning_rate; Stage 2 uses the configured constant/cosine schedule.
         if epoch <= args.stage1_epochs:
             return args.learning_rate
         if args.stage2_lr_schedule == 'constant':
@@ -681,13 +690,13 @@ if __name__ == '__main__':
                 state['img_projector_state_dict'] = img_projector.state_dict()
             torch.save(state, f"{writer.log_dir}/checkpoint_last.pth")
 
-    # Training is complete. checkpoint_last.pth is epoch 30 (not selected by test).
+    # Training is complete. checkpoint_last.pth is the final epoch (not selected by test).
     if args.save_weights:
         shutil.copy2(
             os.path.join(writer.log_dir, 'checkpoint_last.pth'),
             os.path.join(writer.log_dir, 'checkpoint_final.pth'),
         )
-    log('Completed all 30 epochs. Only now preparing test images and target EEG for final evaluation.')
+    log(f'Completed all {args.num_epochs} epochs. Only now preparing test images and EEG test data for final evaluation.')
     if args.use_multilayer_router:
         # Pretrained image features do not update trainable parameters; nevertheless
         # defer the held-out image bank until training is already finished.
@@ -783,6 +792,6 @@ if __name__ == '__main__':
     pd.DataFrame(result_dict, index=[0]).to_csv(
         os.path.join(writer.log_dir, 'result.csv'), index=False
     )
-    log(f'FINAL fixed-epoch={args.num_epochs}: Top-1={top1_acc:.2f}%, '
+    log(f'FINAL protocol={args.protocol}, fixed-epoch={args.num_epochs}: Top-1={top1_acc:.2f}%, '
         f'Top-5={top5_acc:.2f}%, test_loss={avg_test_loss:.4f}')
     writer.close()
