@@ -10,13 +10,13 @@ DEVICE="${DEVICE:-cuda:${GPU_ID}}"
 EEG_ENCODER_TYPE="${EEG_ENCODER_TYPE:-TSConv}"
 BATCH_SIZE="${BATCH_SIZE:-1024}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
-STAGE2_LEARNING_RATE="1e-5"
+STAGE2_LEARNING_RATE="${STAGE2_LEARNING_RATE:-1e-5}"
 SEED="${SEED:-2025}"
 NUM_EPOCHS=30
 STAGE1_EPOCHS=20
 PROJECTOR="linear"
 FEATURE_DIM=512
-OUTPUT_DIR="${OUTPUT_DIR:-./results/things_eeg/inter"
+OUTPUT_DIR="${OUTPUT_DIR:-./results/things_eeg/inter_fixed30_stage2lr1e5_seed${SEED}}"
 SUBJECTS="${SUBJECTS:-1 2 3 4 5 6 7 8 9 10}"
 mkdir -p "$OUTPUT_DIR"
 
@@ -34,6 +34,7 @@ for SUB_ID in $SUBJECTS; do
 
     echo "[LOSO] target=${SUB_ID}; training sources=${TRAIN_IDS[*]}"
     python -u train.py \
+        --protocol inter \
         --batch_size "$BATCH_SIZE" \
         --learning_rate "$LEARNING_RATE" \
         --stage2_learning_rate "$STAGE2_LEARNING_RATE" \
