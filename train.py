@@ -5,6 +5,7 @@ from datetime import datetime
 import json
 import random
 import time
+import math
 import sys
 import shutil
 
@@ -100,7 +101,7 @@ def seed_everything(seed: int = None):
     return seed
 
 
-def prepare_multilayer_feature_dir(src_dir, layer_ids, cache_root, log_fn=print):
+def prepare_multilayer_feature_dir(src_dir, layer_ids, cache_root, log_fn=print, include_test=True):
     """
     Converts folders containing per-layer files like:
       image_train_layer20.npy, ..., image_test_layer36.npy
@@ -146,14 +147,15 @@ def prepare_multilayer_feature_dir(src_dir, layer_ids, cache_root, log_fn=print)
         log_fn(f"Saved multilayer {split} feature to {dst_file}, shape={stacked.shape}")
 
     build_split("train")
-    build_split("test")
+    if include_test:
+        build_split("test")
     return dst_dir
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', default='cuda:0', type=str, help='training device')
-    parser.add_argument('--num_epochs', default=50, type=int, help='number of epochs')
+    parser.add_argument('--num_epochs', default=30, type=int, help='number of epochs')
     parser.add_argument('--batch_size', default=1024, type=int, help='batch size')
     parser.add_argument('--learning_rate', default=1e-4, type=float)
     parser.add_argument('--output_dir', default='./result', type=str)
@@ -193,11 +195,15 @@ if __name__ == '__main__':
     parser.add_argument('--save_weights', action='store_true', help='whether to save model weights')
     parser.add_argument('--stage1_epochs', default=20, type=int, help='epochs for stage-1 alignment')
     parser.add_argument('--stage2_learning_rate', default=5e-5, type=float, help='learning rate after stage-1')
+    parser.add_argument('--stage2_lr_schedule', choices=['constant', 'cosine'], default='constant',
+                        help='Stage-2 epoch learning rate schedule; does not change stage-1')
+    parser.add_argument('--stage2_min_lr', default=1e-6, type=float,
+                        help='Cosine end learning rate at final epoch')
     parser.add_argument('--stage1_mmd_start', default=0.9, type=float, help='initial MMD weight in stage-1')
     parser.add_argument('--stage1_mmd_end', default=0.2, type=float, help='final MMD weight at the end of stage-1')
-    parser.add_argument('--early_stop_patience', default=10, type=int, help='early stop if test Top-1 does not improve for N epochs after stage-1; <=0 disables')
-    parser.add_argument('--early_stop_min_delta', default=0.0, type=float, help='minimum Top-1 improvement in percentage points to reset early stopping')
     parser.add_argument('--seed', type=int, default=None, help='random seed for reproducibility')
+
+    # minimal multilayer router args
     parser.add_argument('--use_multilayer_router', action='store_true')
     parser.add_argument('--layer_ids', default=[20, 24, 28, 32, 36], nargs='+', type=int)
     parser.add_argument('--router_temperature', type=float, default=1.0)
@@ -208,6 +214,25 @@ if __name__ == '__main__':
     parser.add_argument('--layer_prior_strength', type=float, default=1.0)
 
     args = parser.parse_args()
+    # Fixed, precommitted protocol; no target-dependent checkpoint selection.
+    if args.num_epochs != 30:
+        raise ValueError("This trainer is fixed to 30 epochs (set --num_epochs 30).")
+    if not 0 < args.stage1_epochs < args.num_epochs:
+        raise ValueError("Expected 0 < stage1_epochs < 30.")
+    if args.stage1_epochs != 20:
+        raise ValueError('This controlled ablation keeps Stage 1 fixed at 20 epochs.')
+    if args.stage2_learning_rate <= 0:
+        raise ValueError('--stage2_learning_rate must be positive.')
+    if args.stage2_min_lr <= 0 or args.stage2_min_lr > args.stage2_learning_rate:
+        raise ValueError('Require 0 < stage2_min_lr <= stage2_learning_rate.')
+    if len(args.test_subject_ids) != 1:
+        raise ValueError("Inter-subject LOSO requires exactly one held-out subject.")
+    if set(args.train_subject_ids) & set(args.test_subject_ids):
+        raise ValueError("Target subject occurs in source training subjects (LOSO leakage)!")
+    if args.router_eval_mode != 'global':
+        raise ValueError("Strict LOSO evaluation requires --router_eval_mode global.")
+    if args.eeg_test_aug or args.image_test_aug:
+        raise ValueError("Strict final evaluation does not support test-time augmentation flags.")
     seed = seed_everything(seed=args.seed)
 
     if args.output_name is not None:
@@ -288,6 +313,7 @@ if __name__ == '__main__':
             layer_ids=args.layer_ids,
             cache_root=os.path.join(writer.log_dir, 'multilayer_cache'),
             log_fn=log,
+            include_test=False,
         )
         log(f'Effective multilayer image_feature_dir: {effective_image_feature_dir}')
 
@@ -334,29 +360,6 @@ if __name__ == '__main__':
     log(f'sample text_feature shape: {tuple(sample[2].shape)}')
 
     dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=0)
-
-    print('\n>>> Loading Test Data <<<')
-    test_dataset = EEGPreImageDataset(
-        args.test_subject_ids,
-        args.eeg_data_dir,
-        args.selected_channels,
-        args.time_window,
-        effective_image_feature_dir,
-        args.text_feature_dir,
-        args.image_aug,
-        aug_image_feature_dirs,
-        True,
-        False,
-        eeg_transform,
-        False,
-        args.image_test_aug,
-        args.eeg_test_aug,
-        args.frozen_eeg_prior,
-    )
-    log(f'test image_features shape: {tuple(test_dataset.image_features.shape)}')
-    test_sample = test_dataset[0]
-    log(f'test sample image_feature shape: {tuple(test_sample[1].shape)}')
-    test_dataloader = DataLoader(test_dataset, batch_size=200, shuffle=False)
 
     args_dict = vars(args)
     keys_needed = ['eeg_encoder_type', 'eeg_data_dir', 'image_feature_dir']
@@ -493,6 +496,18 @@ if __name__ == '__main__':
             trainable_parameters.extend([p for p in criterion.parameters() if p.requires_grad])
         return optim.AdamW(trainable_parameters, lr=lr, betas=(0.9, 0.999), weight_decay=1e-4)
 
+    def learning_rate_for_epoch(epoch):
+        # E1-E20 unchanged; E21-E30 apply Stage-2 constant or cosine schedule.
+        if epoch <= args.stage1_epochs:
+            return args.learning_rate
+        if args.stage2_lr_schedule == 'constant':
+            return args.stage2_learning_rate
+        stage2_epochs = args.num_epochs - args.stage1_epochs
+        fraction = (epoch - args.stage1_epochs - 1) / max(1, stage2_epochs - 1)
+        return args.stage2_min_lr + 0.5 * (
+            args.stage2_learning_rate - args.stage2_min_lr
+        ) * (1.0 + math.cos(math.pi * fraction))
+
     optimizer = build_optimizer(args.learning_rate, include_share_encoder=True)
 
     def apply_layer_dropout(weights, drop_prob):
@@ -550,13 +565,9 @@ if __name__ == '__main__':
     else:
         img_projector.train()
 
-    best_top1_acc = 0.0
-    best_top5_acc = 0.0
-    best_test_loss = float('inf')
-    best_test_epoch = 0
-    early_stop_counter = 0
     share_encoder_frozen = False
     stage2_switched = False
+    train_history = []
 
     for epoch in range(1, args.num_epochs + 1):
         model.train()
@@ -582,7 +593,16 @@ if __name__ == '__main__':
         if (not stage2_switched) and (epoch > args.stage1_epochs):
             optimizer = build_optimizer(args.stage2_learning_rate, include_share_encoder=False)
             stage2_switched = True
-            log(f'Switch optimizer at epoch {epoch}, stage2 lr = {args.stage2_learning_rate}')
+            log(f'Switch optimizer at epoch {epoch}, stage2 lr schedule = {args.stage2_lr_schedule}')
+
+        # Explicit epoch-wise LR update. Runs only after Stage-2 is entered.
+        current_lr = learning_rate_for_epoch(epoch)
+        if epoch > args.stage1_epochs:
+            for group in optimizer.param_groups:
+                group['lr'] = current_lr
+        writer.add_scalar('LR/optimizer', current_lr, epoch)
+        if epoch > args.stage1_epochs:
+            log(f'Stage-2 epoch {epoch}/{args.num_epochs}: learning_rate={current_lr:.9g}')
 
         total_loss = 0.0
         for batch in tqdm(dataloader, desc=f'Epoch {epoch}/{args.num_epochs} [Train]'):
@@ -615,6 +635,16 @@ if __name__ == '__main__':
 
         avg_loss = total_loss / len(dataloader)
         writer.add_scalar('Loss/train', avg_loss, epoch)
+        train_history.append({
+            'epoch': epoch,
+            'stage': 1 if epoch <= args.stage1_epochs else 2,
+            'learning_rate': current_lr,
+            'train_loss': avg_loss,
+        })
+        # Save after every epoch, so partial runs still retain optimizer evidence.
+        pd.DataFrame(train_history).to_csv(
+            os.path.join(writer.log_dir, 'train_epoch_metrics.csv'), index=False
+        )
         if epoch <= args.stage1_epochs:
             mmd_w, contrast_w = get_stage1_weights(epoch, args.stage1_epochs, args.stage1_mmd_start, args.stage1_mmd_end)
             writer.add_scalar('LossWeight/mmd', mmd_w, epoch)
@@ -640,6 +670,8 @@ if __name__ == '__main__':
                 'optimizer_state_dict': optimizer.state_dict(),
                 'share_enc_state_dict': share_encoder.state_dict(),
                 'loss': avg_loss,
+                'learning_rate': current_lr,
+                'stage2_lr_schedule': args.stage2_lr_schedule,
             }
             if use_multilayer_router:
                 state['img_projectors_state_dict'] = img_projectors.state_dict()
@@ -649,104 +681,108 @@ if __name__ == '__main__':
                 state['img_projector_state_dict'] = img_projector.state_dict()
             torch.save(state, f"{writer.log_dir}/checkpoint_last.pth")
 
-        model.eval()
-        eeg_projector.eval()
-        img_pre_projector.eval()
-        text_projector.eval()
-        share_encoder.eval()
-        if use_multilayer_router:
-            img_projectors.eval()
-            layer_router.eval()
-        else:
-            img_projector.eval()
+    # Training is complete. checkpoint_last.pth is epoch 30 (not selected by test).
+    if args.save_weights:
+        shutil.copy2(
+            os.path.join(writer.log_dir, 'checkpoint_last.pth'),
+            os.path.join(writer.log_dir, 'checkpoint_final.pth'),
+        )
+    log('Completed all 30 epochs. Only now preparing test images and target EEG for final evaluation.')
+    if args.use_multilayer_router:
+        # Pretrained image features do not update trainable parameters; nevertheless
+        # defer the held-out image bank until training is already finished.
+        prepare_multilayer_feature_dir(
+            src_dir=args.image_feature_dir,
+            layer_ids=args.layer_ids,
+            cache_root=os.path.join(writer.log_dir, 'multilayer_cache'),
+            log_fn=log,
+            include_test=True,
+        )
 
-        total_test_loss = 0.0
-        eeg_feature_list = []
-        image_feature_list = []
+    print('\n>>> Loading Target Test Data (POST-TRAIN ONLY) <<<')
+    test_dataset = EEGPreImageDataset(
+        args.test_subject_ids,
+        args.eeg_data_dir,
+        args.selected_channels,
+        args.time_window,
+        effective_image_feature_dir,
+        args.text_feature_dir,
+        args.image_aug,
+        aug_image_feature_dirs,
+        True,
+        False,
+        eeg_transform,
+        False,
+        args.image_test_aug,
+        args.eeg_test_aug,
+        args.frozen_eeg_prior,
+    )
+    log(f'test image_features shape: {tuple(test_dataset.image_features.shape)}')
+    test_sample = test_dataset[0]
+    log(f'test sample image_feature shape: {tuple(test_sample[1].shape)}')
+    test_dataloader = DataLoader(test_dataset, batch_size=200, shuffle=False)
 
-        with torch.no_grad():
-            for batch in test_dataloader:
-                eeg_batch = batch[0].to(device)
-                subject_id_batch = batch[3].to(device)
-                image_feature_batch = batch[1].to(device)
-                text_feature_batch = batch[2].to(device)
 
-                if args.eeg_encoder_type in ['ATM']:
-                    eeg_feature_batch = model(eeg_batch, subject_id_batch)
-                else:
-                    eeg_feature_batch = model(eeg_batch)
+    # Single final evaluation. These metrics never feed back into training.
+    model.eval()
+    eeg_projector.eval()
+    img_pre_projector.eval()
+    text_projector.eval()
+    share_encoder.eval()
+    if use_multilayer_router:
+        img_projectors.eval()
+        layer_router.eval()
+    else:
+        img_projector.eval()
 
-                eeg_feature_batch = eeg_projector(eeg_feature_batch)
-                eeg_feature_batch = share_encoder(eeg_feature_batch)
+    total_test_loss = 0.0
+    eeg_feature_list = []
+    image_feature_list = []
 
-                image_feature_batch = build_image_teacher(image_feature_batch, subject_id_batch, training=False)
-                text_feature_batch = text_projector(text_feature_batch)
+    with torch.no_grad():
+        for batch in test_dataloader:
+            eeg_batch = batch[0].to(device)
+            subject_id_batch = batch[3].to(device)
+            image_feature_batch = batch[1].to(device)
+            text_feature_batch = batch[2].to(device)
 
-                loss = criterion(eeg_feature_batch, image_feature_batch, text_feature_batch)
-                total_test_loss += loss.item()
+            if args.eeg_encoder_type in ['ATM']:
+                eeg_feature_batch = model(eeg_batch, subject_id_batch)
+            else:
+                eeg_feature_batch = model(eeg_batch)
 
-                eeg_feature_list.append(eeg_feature_batch.cpu().numpy())
-                image_feature_list.append(image_feature_batch.cpu().numpy())
+            eeg_feature_batch = eeg_projector(eeg_feature_batch)
+            eeg_feature_batch = share_encoder(eeg_feature_batch)
 
-        avg_test_loss = total_test_loss / len(test_dataloader)
-        writer.add_scalar('Loss/test', avg_test_loss, epoch)
+            image_feature_batch = build_image_teacher(image_feature_batch, subject_id_batch, training=False)
+            text_feature_batch = text_projector(text_feature_batch)
 
-        eeg_feature_all = np.concatenate(eeg_feature_list, axis=0)
-        image_feature_all = np.concatenate(image_feature_list, axis=0)
-        top5_count, top1_count, total = retrieve_all(eeg_feature_all, image_feature_all, args.data_average)
-        top5_acc = top5_count / total * 100
-        top1_acc = top1_count / total * 100
-        log(f'top5 acc {top5_acc:.2f}%\ttop1 acc {top1_acc:.2f}%\tTest Loss: {avg_test_loss:.4f}')
+            loss = criterion(eeg_feature_batch, image_feature_batch, text_feature_batch)
+            total_test_loss += loss.item()
 
-        is_better = False
-        if top1_acc > best_top1_acc + args.early_stop_min_delta:
-            is_better = True
-        elif avg_test_loss < best_test_loss and top1_acc == best_top1_acc:
-            is_better = True
+            eeg_feature_list.append(eeg_feature_batch.cpu().numpy())
+            image_feature_list.append(image_feature_batch.cpu().numpy())
 
-        if is_better:
-            best_test_loss = avg_test_loss
-            best_top5_acc = top5_acc
-            best_top1_acc = top1_acc
-            best_test_epoch = epoch
-            if args.save_weights:
-                state = {
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'eeg_projector_state_dict': eeg_projector.state_dict(),
-                    'img_pre_projector_state_dict': img_pre_projector.state_dict(),
-                    'text_projector_state_dict': text_projector.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'share_enc_state_dict': share_encoder.state_dict(),
-                    'loss': avg_test_loss,
-                }
-                if use_multilayer_router:
-                    state['img_projectors_state_dict'] = img_projectors.state_dict()
-                    state['layer_router_state_dict'] = layer_router.state_dict()
-                    state['layer_ids'] = args.layer_ids
-                else:
-                    state['img_projector_state_dict'] = img_projector.state_dict()
-                torch.save(state, f"{writer.log_dir}/checkpoint_test_best.pth")
+    avg_test_loss = total_test_loss / len(test_dataloader)
+    writer.add_scalar('Loss/test', avg_test_loss, args.num_epochs)
 
-            early_stop_counter = 0
-        else:
-            if epoch > args.stage1_epochs:
-                early_stop_counter += 1
-                if args.early_stop_patience > 0:
-                    log(f'EarlyStop counter: {early_stop_counter}/{args.early_stop_patience} | best epoch: {best_test_epoch}')
+    eeg_feature_all = np.concatenate(eeg_feature_list, axis=0)
+    image_feature_all = np.concatenate(image_feature_list, axis=0)
+    top5_count, top1_count, total = retrieve_all(eeg_feature_all, image_feature_all, args.data_average)
+    top5_acc = top5_count / total * 100
+    top1_acc = top1_count / total * 100
+    log(f'top5 acc {top5_acc:.2f}%\ttop1 acc {top1_acc:.2f}%\tTest Loss: {avg_test_loss:.4f}')
 
-        if args.early_stop_patience > 0 and epoch > args.stage1_epochs and early_stop_counter >= args.early_stop_patience:
-            log(f'Early stopping at epoch {epoch}: no Top-1 improvement for {args.early_stop_patience} epochs after stage-1. Best epoch = {best_test_epoch}.')
-            break
 
-    result_dict = {}
-    result_dict['top1 acc'] = f'{top1_acc:.2f}'
-    result_dict['top5 acc'] = f'{top5_acc:.2f}'
-    result_dict['best top1 acc'] = f'{best_top1_acc:.2f}'
-    result_dict['best top5 acc'] = f'{best_top5_acc:.2f}'
-    result_dict['best test loss'] = f'{best_test_loss:.4f}'
-    result_dict['best epoch'] = best_test_epoch
-    df = pd.DataFrame(result_dict, index=[0])
-    df.to_csv(os.path.join(log_dir, 'result.csv'), index=False)
-
-    log(f'best test loss: {best_test_loss:.4f} top5 acc: {best_top5_acc:.2f} top1 acc: {best_top1_acc:.2f} at epoch {best_test_epoch}')
+    result_dict = {
+        'top1 acc': f'{top1_acc:.2f}',
+        'top5 acc': f'{top5_acc:.2f}',
+        'final test loss': f'{avg_test_loss:.4f}',
+        'final epoch': args.num_epochs,
+    }
+    pd.DataFrame(result_dict, index=[0]).to_csv(
+        os.path.join(writer.log_dir, 'result.csv'), index=False
+    )
+    log(f'FINAL fixed-epoch={args.num_epochs}: Top-1={top1_acc:.2f}%, '
+        f'Top-5={top5_acc:.2f}%, test_loss={avg_test_loss:.4f}')
+    writer.close()
