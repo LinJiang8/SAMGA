@@ -22,7 +22,7 @@ SAMGA aligns visually evoked EEG signals with pretrained visual representations 
 | Dataset | Setting | Top-1 | Top-5 |
 | --- | --- | ---: | ---: |
 | THINGS-EEG | Intra-subject | 91.3 | 98.8 |
-| THINGS-EEG | Inter-subject | 34.4 | 64.8 |
+| THINGS-EEG | Inter-subject | 31.4 | 63.1 |
 
 ## Highlights
 
