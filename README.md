@@ -49,7 +49,6 @@ updated results using the final epoch
     |-- dataset.py             # EEG/image/text feature datasets
     |-- loss.py                # contrastive and MMD losses
     |-- projector.py           # projection heads and shared encoder
-    |-- DBComformer.py         # EEG encoder components
     |-- view_fusion.py         # visual feature fusion modules
     |-- eeg_augmentation.py    # EEG augmentations
     |-- image_augmentation.py  # image feature augmentation helpers
@@ -57,24 +56,7 @@ updated results using the final epoch
     `-- eeg_encoder/           # EEG encoders, including ATM-style encoder blocks
 ```
 
-## Installation
 
-Create a clean Python environment, then install the dependencies:
-
-```bash
-conda create -n samga python=3.10 -y
-conda activate samga
-pip install -r requirements.txt
-```
-
-Install the PyTorch build that matches your CUDA driver if the default wheel is not suitable for your machine. For example, install the CUDA 12.1 wheel first, then install the remaining requirements:
-
-```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-pip install -r requirements.txt
-```
-
-Adjust the CUDA wheel URL to your local CUDA/runtime setup.
 
 ## Data Preparation
 
@@ -100,14 +82,7 @@ data/things_eeg/
 |   |   |-- image_test_layer28.npy
 |   |   |-- image_test_layer32.npy
 |   |   `-- image_test_layer36.npy
-|   `-- RN50/                         # augmentation features used by inter.sh
-|-- text_feature/
-|   |-- class_names/
-|   |   |-- train.npy                 # [1654, 10, 1024], float32
-|   |   `-- test.npy                  # [200, 1, 1024], float32
-|   `-- detail_caption/
-|       |-- train.npy
-|       `-- test.npy
+
 `-- image_set/
     |-- train_images/
     `-- test_images/
@@ -115,36 +90,6 @@ data/things_eeg/
 
 The main experiments use `image_feature/internvit_multilevel_20_24_28_32_36` with visual layers `20 24 28 32 36`. Text features are optional; the provided launchers set `TEXT_FEATURE_DIR=""` to disable them.
 
-If starting from raw THINGS-EEG files, preprocess them with:
-
-```bash
-python preprocess_eeg.py \
-  --raw_data_dir ./data/things_eeg/raw_eeg \
-  --output_dir ./data/things_eeg/preprocessed_eeg \
-  --sub_id 0 \
-  --ses_id 0 \
-  --zscore
-```
-
-Use exactly one normalization flag: `--zscore` or `--mvnn`. The prepared dataset and feature files are large, so do not commit `data/things_eeg`, generated caches, checkpoints, TensorBoard logs, or result folders to GitHub.
-
-## Reproduction
-
-After preparing EEG data and image features under `./data/things_eeg`, check the configuration variables at the top of `intra.sh` and `inter.sh`. The default data paths match the layout above; usually only `DEVICE` and `OUTPUT_DIR` need to be changed for a new machine.
-
-Run intra-subject experiments:
-
-```bash
-bash ./intra.sh
-```
-
-Run inter-subject leave-one-subject-out experiments:
-
-```bash
-bash ./inter.sh
-```
-
-Both scripts train all subjects and call `compute_avg_results.py` automatically to generate `avg_results.csv` in the corresponding output directory.
 
 ## Common Pitfalls
 
